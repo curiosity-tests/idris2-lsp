@@ -3,12 +3,12 @@ run-name: "Ubuntu ${{ inputs.leg || github.event_name }} ${{ inputs.racecar_run 
 on:
   push:
     branches:
-      - '**'
+    - '**'
     tags:
-      - '**'
+    - '**'
   pull_request:
     branches:
-      - main
+    - main
 
   workflow_dispatch:
     inputs:
@@ -39,50 +39,122 @@ jobs:
       IDRIS2_CG: chez
       IDRIS2_TESTS_CG: chez
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Get Idris2 commit
-        id: get-idris2-commit
-        run: echo "idris2-commit=$(git rev-parse @:./Idris2)" >> $GITHUB_ENV
-      - name: Cache Idris2 with API
-        id: cache-idris2-with-api
-        uses: actions/cache@v4
-        with:
-          path: ~/.idris2/
-          key: ${{ env.idris2-commit }}-idris2-with-api
-      - name: Get Idris2 Submodule
-        if: steps.cache-idris2-with-api.outputs.cache-hit != 'true'
-        run: |
-          git submodule update --init Idris2
-      - name: Install build dependencies
-        if: steps.cache-idris2-with-api.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get install -y chezscheme
-          echo "$HOME/.idris2/bin" >> $GITHUB_PATH
-      - name: Build Idris2 with API
-        if: steps.cache-idris2-with-api.outputs.cache-hit != 'true'
-        working-directory: Idris2
-        run: |
-          make bootstrap && make install
-          make clean
-          make all && make install
-          make install-api
-      - name: Artifact Idris2 with API
-        uses: actions/upload-artifact@v4
-        with:
-          name: installed-idris2-with-api
-          path: ~/.idris2/
-          retention-days: 1
-          include-hidden-files: true
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Get Idris2 commit
+      id: get-idris2-commit
+      run: echo "idris2-commit=$(git rev-parse @:./Idris2)" >> $GITHUB_ENV
+    - name: Cache Idris2 with API
+      id: cache-idris2-with-api
+      uses: actions/cache@v4
+      with:
+        path: ~/.idris2/
+        key: ${{ env.idris2-commit }}-idris2-with-api
+    - name: Get Idris2 Submodule
+      if: steps.cache-idris2-with-api.outputs.cache-hit != 'true'
+      run: |
+        git submodule update --init Idris2
+    - name: Install build dependencies
+      if: steps.cache-idris2-with-api.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get install -y chezscheme
+        echo "$HOME/.idris2/bin" >> $GITHUB_PATH
+    - name: Build Idris2 with API
+      if: steps.cache-idris2-with-api.outputs.cache-hit != 'true'
+      working-directory: Idris2
+      run: |
+        make bootstrap && make install
+        make clean
+        make all && make install
+        make install-api
+    - name: Artifact Idris2 with API
+      uses: actions/upload-artifact@v4
+      with:
+        name: installed-idris2-with-api
+        path: ~/.idris2/
+        retention-days: 1
+        include-hidden-files: true
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   build:
     runs-on: ubuntu-latest
     needs: build-idris2-with-api
@@ -90,35 +162,107 @@ jobs:
       IDRIS2_CG: chez
       IDRIS2_TESTS_CG: chez
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Download Idris2 with API Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: installed-idris2-with-api
-          path: ~/.idris2/
-      - name: Install build dependencies
-        run: |
-          sudo apt-get install -y chezscheme
-          echo "$HOME/.idris2/bin" >> $GITHUB_PATH
-          chmod +x $HOME/.idris2/bin/idris2 $HOME/.idris2/bin/idris2_app/*
-      - name: Get LSP-lib submodule
-        run: |
-          git submodule update --init LSP-lib
-      - name: Build and install LSP-lib
-        working-directory: LSP-lib
-        run: |
-          idris2 --install-with-src
-      - name: build and test
-        run: |
-          make build && make test INTERACTIVE=''
-        shell: bash
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Download Idris2 with API Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: installed-idris2-with-api
+        path: ~/.idris2/
+    - name: Install build dependencies
+      run: |
+        sudo apt-get install -y chezscheme
+        echo "$HOME/.idris2/bin" >> $GITHUB_PATH
+        chmod +x $HOME/.idris2/bin/idris2 $HOME/.idris2/bin/idris2_app/*
+    - name: Get LSP-lib submodule
+      run: |
+        git submodule update --init LSP-lib
+    - name: Build and install LSP-lib
+      working-directory: LSP-lib
+      run: |
+        idris2 --install-with-src
+    - name: build and test
+      run: |
+        make build && make test INTERACTIVE=''
+      shell: bash
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
